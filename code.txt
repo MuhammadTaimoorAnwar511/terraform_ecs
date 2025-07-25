@@ -1,0 +1,595 @@
+# modules/acm/main.tf
+resource "aws_acm_certificate" "this" {
+  count             = var.enable_acm ? 1 : 0
+  domain_name       = var.domain_name
+  validation_method = "DNS"
+  tags              = var.tags
+}
+
+locals {
+  domain_validation_option = one(aws_acm_certificate.this[0].domain_validation_options)
+}
+
+resource "aws_route53_record" "validation" {
+  count   = var.enable_acm && var.acm_dns_validation_auto ? 1 : 0
+
+  name    = local.domain_validation_option.resource_record_name
+  type    = local.domain_validation_option.resource_record_type
+  zone_id = var.route53_zone_id
+  records = [local.domain_validation_option.resource_record_value]
+  ttl     = 300
+}
+resource "aws_acm_certificate_validation" "this" {
+  count = var.enable_acm && var.acm_dns_validation_auto ? 1 : 0
+
+  certificate_arn         = aws_acm_certificate.this[0].arn
+  validation_record_fqdns = [aws_route53_record.validation[0].fqdn]
+
+  depends_on = [aws_route53_record.validation] 
+}
+====
+# modules/acm/outputs.tf
+output "acm_certificate_arn" {
+  description = "Validated or raw ACM certificate ARN"
+  value = var.enable_acm ? (
+    var.acm_dns_validation_auto ?
+    aws_acm_certificate_validation.this[0].certificate_arn :
+    aws_acm_certificate.this[0].arn
+  ) : null
+}
+===
+# modules/acm/variables.tf
+variable "enable_acm" {
+  type        = bool
+  default     = false
+  description = "Whether to request ACM certificate"
+}
+
+variable "domain_name" {
+  type        = string
+  description = "Domain name for the ACM certificate"
+}
+
+variable "acm_dns_validation_auto" {
+  type        = bool
+  default     = false
+  description = "If true, create Route53 records for automatic DNS validation"
+}
+
+variable "route53_zone_id" {
+  type        = string
+  default     = ""
+  description = "Route 53 hosted zone ID (required if auto validation is enabled)"
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+===
+# modules/alb/main.tf
+resource "aws_lb" "this" {
+  name               = var.alb_name
+  load_balancer_type = "application"
+  internal           = false
+  ip_address_type    = "ipv4"
+  security_groups    = var.security_groups
+  subnets            = var.public_subnets
+
+  tags = {
+    Name = var.alb_name
+  }
+}
+
+resource "aws_lb_listener" "https" {
+  count             = var.enable_acm ? 1 : 0
+  load_balancer_arn = aws_lb.this.arn
+  port              = 443
+  protocol          = "HTTPS"
+
+  ssl_policy        = "ELBSecurityPolicy-2016-08"
+  certificate_arn   = var.acm_certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = var.target_group_arn
+  }
+}
+===
+# modules/alb/output.tf
+output "alb_dns_name" {
+  value = aws_lb.this.dns_name
+}
+===
+variable "sg_name" {
+  type        = string
+  description = "Name of the Security Group"
+}
+
+variable "sg_description" {
+  type        = string
+  description = "Description of the Security Group"
+}
+
+variable "vpc_id" {
+  type        = string
+  description = "VPC ID to associate the SG with"
+}
+
+variable "allowed_cidrs" {
+  type        = list(string)
+  description = "CIDR blocks allowed for ingress"
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+===
+# modules/security_group/main.tf
+resource "aws_security_group" "backend_alb_sg" {
+  name        = var.sg_name
+  description = var.sg_description
+  vpc_id      = var.vpc_id
+
+  ingress {
+    description = "Allow HTTP"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_cidrs
+  }
+
+  ingress {
+    description = "Allow HTTPS"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_cidrs
+  }
+
+  egress {
+    description = "Allow all outbound"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = var.tags
+}
+===
+# modules/security_group/outputs.tf
+output "backend_alb_sg_id" {
+  description = "Backend ALB security group ID"
+  value       = aws_security_group.backend_alb_sg.id
+}
+===
+# module/security_group/variables.tf
+variable "sg_name" {
+  type        = string
+  description = "Name of the Security Group"
+}
+
+variable "sg_description" {
+  type        = string
+  description = "Description of the Security Group"
+}
+
+variable "vpc_id" {
+  type        = string
+  description = "VPC ID to associate the SG with"
+}
+
+variable "allowed_cidrs" {
+  type        = list(string)
+  description = "CIDR blocks allowed for ingress"
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+===
+# modules/target_group/main.tf
+resource "aws_lb_target_group" "this" {
+  name        = var.name
+  port        = var.port
+  protocol    = "HTTP"
+  target_type = "ip"
+  vpc_id      = var.vpc_id
+
+  health_check {
+    enabled             = true
+    path                = var.health_check_path
+    protocol            = "HTTP"
+    matcher             = "200"
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    timeout             = 5
+    interval            = 30
+  }
+
+  tags = var.tags
+}
+===
+# modules/target_group/outputs.tf
+output "target_group_arn" {
+  description = "ARN of the backend target group"
+  value       = aws_lb_target_group.this.arn
+}
+===
+# modules/target_group/variables.tf
+
+variable "name" {
+  type        = string
+  description = "Name of the target group"
+}
+
+variable "port" {
+  type        = number
+  description = "Port for the target group"
+}
+
+variable "health_check_path" {
+  type        = string
+  description = "Health check path for target group"
+  default     = "/"
+}
+
+variable "vpc_id" {
+  type        = string
+  description = "VPC ID where target group is created"
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+===
+#modules/vpc/main.tf
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "6.0.1"
+
+  name       = var.vpc_name
+  cidr       = var.vpc_cidr
+  azs        = var.azs
+  public_subnets   = var.public_subnets
+  private_subnets  = var.private_subnets
+
+  enable_nat_gateway     = var.enable_nat_gateway
+  single_nat_gateway     = var.single_nat_gateway
+  one_nat_gateway_per_az = var.one_nat_gateway_per_az
+
+  tags = var.tags
+}
+===
+#modules/vpc/outputs.tf
+output "vpc_id" {
+  value = module.vpc.vpc_id
+}
+
+output "private_subnets" {
+  value = module.vpc.private_subnets
+}
+
+output "public_subnets" {
+  value = module.vpc.public_subnets
+}
+
+output "igw_id" {
+  value = module.vpc.igw_id
+}
+
+output "nat_gateway_ids" {
+  description = "List of NAT Gateway IDs"
+  value       = module.vpc.natgw_ids
+}
+===
+#modules/vpc/variables.tf
+variable "vpc_name" {
+  type        = string
+}
+
+variable "vpc_cidr" {
+  type        = string
+}
+
+variable "azs" {
+  type        = list(string)
+}
+
+variable "public_subnets" {
+  type        = list(string)
+}
+
+variable "private_subnets" {
+  type        = list(string)
+}
+
+variable "enable_nat_gateway" {
+  type        = bool
+  default     = true
+}
+
+variable "single_nat_gateway" {
+  type        = bool
+  default     = true
+}
+
+variable "one_nat_gateway_per_az" {
+  type        = bool
+  default     = false
+}
+
+variable "tags" {
+  type        = map(string)
+  default     = {}
+}
+===
+#  modules/ecs_cluster/main.tf
+resource "aws_ecs_cluster" "this" {
+  name = var.cluster_name
+
+  tags = var.tags
+}
+===
+#  modules/ecs_cluster/outputs.tf
+output "cluster_name" {
+  value = aws_ecs_cluster.this.name
+}
+===
+#  modules/ecs_cluster/variables.tf
+variable "cluster_name" {
+  type        = string
+  description = "Name of the ECS Cluster"
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+====
+ROOT:
+====
+#main.tf
+module "vpc" {
+  source = "./modules/vpc"
+  
+  # Pass all variables to VPC module
+  vpc_name                = var.vpc_name
+  vpc_cidr                = var.vpc_cidr
+  azs                     = var.azs
+  public_subnets          = var.public_subnets
+  private_subnets         = var.private_subnets
+  enable_nat_gateway      = var.enable_nat_gateway
+  single_nat_gateway      = var.single_nat_gateway
+  one_nat_gateway_per_az  = var.one_nat_gateway_per_az
+  tags                    = var.tags
+}
+module "backend_alb_sg" {
+  source = "./modules/security_group"
+
+  sg_name        = var.backend_alb_sg_name
+  sg_description = var.backend_alb_sg_description
+  vpc_id         = module.vpc.vpc_id
+  allowed_cidrs  = var.backend_alb_allowed_cidrs
+  tags           = var.tags
+}
+module "backend_target_group" {
+  source             = "./modules/target_group"
+  name               = var.backend_tg_name
+  port               = var.backend_tg_port
+  health_check_path  = var.backend_tg_health_check_path
+  vpc_id             = module.vpc.vpc_id
+  tags               = var.tags
+}
+module "acm_certificate" {
+  source                  = "./modules/acm"
+  enable_acm              = var.enable_acm
+  domain_name             = var.acm_domain_name
+  acm_dns_validation_auto = var.acm_dns_validation_auto
+  route53_zone_id         = var.route53_zone_id
+  tags                    = var.tags
+}
+module "application_load_balancer" {
+  source              = "./modules/alb"
+  alb_name            = "backend-alb"
+  vpc_id              = module.vpc.vpc_id
+  public_subnets      = module.vpc.public_subnets
+  security_groups  = [module.backend_alb_sg.backend_alb_sg_id]            
+  target_group_arn = module.backend_target_group.target_group_arn 
+
+  enable_acm          = var.enable_acm
+  acm_certificate_arn = module.acm_certificate.acm_certificate_arn
+}
+module "ecs_cluster" {
+  source       = "./modules/ecs_cluster"
+  cluster_name = "backend-cluster"
+  tags         = var.tags
+}
+===
+#provider.tf
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+===
+#variables.tf
+variable "aws_region" {
+  type    = string
+  default = "us-east-1"
+}
+
+variable "vpc_name" {
+  type    = string
+  default = "MyAppVPC"
+}
+
+variable "vpc_cidr" {
+  type    = string
+  default = "10.0.0.0/16"
+}
+
+variable "azs" {
+  type    = list(string)
+  default = ["us-east-1a", "us-east-1b"]
+}
+
+variable "public_subnets" {
+  type    = list(string)
+  default = ["10.0.0.0/24", "10.0.1.0/24"]
+}
+
+variable "private_subnets" {
+  type    = list(string)
+  default = ["10.0.2.0/24", "10.0.3.0/24"]
+}
+variable "enable_nat_gateway" {
+  description = "Whether to provision NAT Gateways"
+  type        = bool
+  default     = true
+}
+
+variable "single_nat_gateway" {
+  description = "Provision a single shared NAT Gateway"
+  type        = bool
+  default     = true
+}
+
+variable "one_nat_gateway_per_az" {
+  description = "Provision one NAT Gateway per Availability Zone"
+  type        = bool
+  default     = false
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {
+    Environment = "dev"
+    Project     = "MyApp"
+  }
+}
+# SECURITY GROUP VARIABLES
+
+variable "backend_alb_sg_name" {
+  type        = string
+  description = "Name of the backend ALB security group"
+}
+
+variable "backend_alb_sg_description" {
+  type        = string
+  description = "Description for the backend ALB security group"
+}
+
+variable "backend_alb_allowed_cidrs" {
+  type        = list(string)
+  description = "CIDR blocks allowed to access backend ALB"
+}
+# TARGET GROUP VARIABLES
+variable "backend_tg_name" {
+  type        = string
+  description = "Name for the backend target group"
+}
+
+variable "backend_tg_port" {
+  type        = number
+  description = "Port for the backend target group"
+}
+
+variable "backend_tg_health_check_path" {
+  type        = string
+  description = "Health check path for backend target group"
+  default     = "/"
+}
+# ACM VARIABLES
+variable "enable_acm" {
+  type        = bool
+  default     = false
+}
+
+variable "acm_domain_name" {
+  type        = string
+  default     = ""
+}
+
+variable "acm_dns_validation_auto" {
+  type        = bool
+  default     = false
+  description = "If true, automatically create Route53 DNS records for ACM validation"
+}
+
+variable "route53_zone_id" {
+  type        = string
+  default     = ""
+}
+
+variable "acm_certificate_arn" {
+  type    = string
+  default = null
+}
+# ECS CLUSTER VARIABLES
+variable "cluster_name" {
+  type        = string
+  default     = "backend-cluster"
+  description = "Name of the ECS Cluster"
+}
+
+===
+# terraform.tfvars
+aws_region         = "us-east-1"
+# VPC configuration
+vpc_name           = "MyAppVPC"
+vpc_cidr           = "10.0.0.0/16"
+azs                = ["us-east-1a", "us-east-1b"]
+
+public_subnets     = ["10.0.0.0/24", "10.0.1.0/24"]
+private_subnets    = ["10.0.2.0/24", "10.0.3.0/24"]
+
+# NAT Gateway configuration
+enable_nat_gateway       = true
+single_nat_gateway       = true
+one_nat_gateway_per_az   = false
+
+# Backend ALB Security Group config
+backend_alb_sg_name        = "MTAPP-backend-alb-sg"
+backend_alb_sg_description = "Security group for MYAPP backend ALB"
+backend_alb_allowed_cidrs  = ["0.0.0.0/0"]
+
+# ALB Target Group Config
+backend_tg_name                = "backend-tg"
+backend_tg_port                = 5000
+backend_tg_health_check_path   = "/"
+
+# ACM Certificate Config
+enable_acm               = true
+acm_domain_name          = "taimoor.quecko.org"
+acm_dns_validation_auto  = false
+route53_zone_id          = "Z3P5QSUBK4POTI"  # Your actual Hosted Zone ID
+# ECS Cluster Config
+cluster_name = "MYAPP-backend-cluster"
+# Global tags
+tags = {
+  Environment = "dev"
+  Project     = "MyApp"
+}
+====
+
